@@ -1,0 +1,510 @@
+name: ZhuHen Sync
+
+# 本 workflow 与上游 build.yml 完全独立，不修改 build.yml 任何内容。
+#
+# 整体流程：
+#   1. 定时检测 2dust/v2rayNG 上游是否发布了新版本（只认"确实修改了 versionName" 的
+#      那一次提交，忽略同一天版本号提交之后的其他改动）
+#   2. 没有新版本 -> 什么都不做，master 完全不受影响
+#   3. 有新版本 -> 把改动推到一个临时的 sync-staging 分支（reset 到那一次精确提交 +
+#      改名 + isXray 补丁），触发 build.yml 对着这个分支跑一遍完整构建，原地等结果
+#   4. 构建失败 -> 直接结束，master 从头到尾没被碰过，等同于这次同步没发生过，
+#      明天定时任务会自动重新尝试，不需要任何回滚逻辑
+#   5. 构建成功 -> APK 和 Release 已经由 build.yml 产出好了，这时候才把
+#      sync-staging 的内容落到 master 上，供下次比对版本号使用
+
+on:
+  schedule:
+    - cron: '43 1 * * *'   # 每天 UTC 01:43（故意避开整点，降低被 GitHub 延迟/丢弃的概率）
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制同步（忽略版本号检测，用于手动测试）'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+  actions: write
+
+# 防止定时任务和手动触发同时跑而互相打架
+concurrency:
+  group: zhuhen-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: 2dust/v2rayNG
+  APP_NAME: "竹痕"
+  APPLICATION_ID: com.zhuhen.app
+  FDROID_APPLICATION_ID: com.zhuhen.app.fdroid
+  GRADLE_FILE: V2rayNG/app/build.gradle.kts
+  STRINGS_FILE: V2rayNG/app/src/main/res/values/strings.xml
+  FDROID_STRINGS_FILE: V2rayNG/app/src/fdroid/res/values/strings.xml
+  DEV_STRINGS_FILE: V2rayNG/app/src/dev/res/values/strings.xml
+  PRE_RELEASE_STRINGS_FILE: V2rayNG/app/src/pre_release/res/values/strings.xml
+  MAIN_SHORTCUTS: V2rayNG/app/src/main/res/xml/shortcuts.xml
+  FDROID_SHORTCUTS: V2rayNG/app/src/fdroid/res/xml/shortcuts.xml
+  UTILS_FILE: V2rayNG/app/src/main/java/com/v2ray/ang/util/Utils.kt
+  WORKFLOW_SELF_PATH: .github/workflows/zhuhen-sync-8f2a.yml
+  STAGING_BRANCH: sync-staging
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # 要覆盖"等 build.yml 跑完两个 flavor x 四个架构"的时间，留足余量
+    timeout-minutes: 180
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: master
+
+      # actions/checkout 默认用 GITHUB_TOKEN 认证（写入本地 http.extraheader），
+      # 但本 workflow 后面会往 sync-staging / master 推送涉及
+      # .github/workflows/ 的改动，GITHUB_TOKEN 没有 workflows 权限、无法推送
+      # 这类改动，必须换成有 workflow scope 的 SYNC_PAT。这里提前切换一次，
+      # 后面所有涉及 origin 的 push 就不需要重复处理了。
+      # 注意：必须先清掉 checkout 留下的 extraheader，它的优先级高于 remote
+      # URL 里嵌的账号密码，不清掉的话即使换了 URL 实际推送时还是会用回
+      # GITHUB_TOKEN。此时还不需要判断 should_sync，因为这一步本身没有副作用，
+      # 只有真正执行 push 的步骤才会用到这份凭据。
+      - name: Switch git credentials to SYNC_PAT
+        run: |
+          set -euo pipefail
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git remote set-url origin "https://x-access-token:${{ secrets.SYNC_PAT }}@github.com/${{ github.repository }}.git"
+
+      # ---------- 第一步：判断要不要同步 ----------
+
+      - name: Find upstream version-bump commit
+        id: find_commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          AUTH_HEADER="Authorization: Bearer ${GH_TOKEN}"
+
+          commits_json=$(curl -sSL \
+            -H "$AUTH_HEADER" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/commits?path=V2rayNG/app/build.gradle.kts&sha=master&per_page=50")
+
+          shas=$(echo "$commits_json" | jq -r '.[].sha')
+
+          found_sha=""
+          found_version=""
+          for sha in $shas; do
+            diff=$(curl -sSL \
+              -H "$AUTH_HEADER" \
+              -H "Accept: application/vnd.github.v3.diff" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/commits/${sha}")
+
+            newver=$(echo "$diff" | grep -m1 '^+.*versionName = "' | sed -E 's/.*versionName = "([^"]+)".*/\1/' || true)
+
+            if [ -n "$newver" ]; then
+              found_sha="$sha"
+              found_version="$newver"
+              break
+            fi
+          done
+
+          if [ -z "$found_sha" ]; then
+            echo "::error::在最近 50 次改动 build.gradle.kts 的提交里没找到 versionName 变更，可能需要扩大搜索范围。"
+            exit 1
+          fi
+
+          echo "找到版本变更提交: $found_sha -> versionName=$found_version"
+          echo "sha=$found_sha" >> "$GITHUB_OUTPUT"
+          echo "version=$found_version" >> "$GITHUB_OUTPUT"
+
+      - name: Compare with current version
+        id: compare
+        run: |
+          set -euo pipefail
+          current=$(grep -m1 'versionName = "' "$GRADLE_FILE" | sed -E 's/.*versionName = "([^"]+)".*/\1/' || echo "")
+          upstream="${{ steps.find_commit.outputs.version }}"
+
+          echo "当前 master 版本: $current"
+          echo "上游最新版本: $upstream"
+
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            echo "手动强制同步"
+            echo "should_sync=true" >> "$GITHUB_OUTPUT"
+          elif [ "$current" != "$upstream" ]; then
+            echo "should_sync=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_sync=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: No update, stop here
+        if: steps.compare.outputs.should_sync == 'false'
+        run: echo "上游没有新版本，本次不做任何操作，master 未受影响。"
+
+      # ---------- 第二步：在 sync-staging 分支上准备改名后的代码（不碰 master）----------
+
+      - name: Fetch upstream commit
+        if: steps.compare.outputs.should_sync == 'true'
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${{ steps.find_commit.outputs.sha }}"
+
+      - name: Create staging branch at that exact upstream commit
+        if: steps.compare.outputs.should_sync == 'true'
+        run: |
+          set -euo pipefail
+          git checkout -B "$STAGING_BRANCH" "${{ steps.find_commit.outputs.sha }}"
+
+      - name: Sync submodules to that commit's state
+        if: steps.compare.outputs.should_sync == 'true'
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Apply rebrand (application id / app name / isXray patch)
+        if: steps.compare.outputs.should_sync == 'true'
+        run: |
+          set -euo pipefail
+
+          # 1. applicationId
+          sed -i "s/applicationId = \"com.v2ray.ang\"/applicationId = \"${APPLICATION_ID}\"/" "$GRADLE_FILE"
+
+          # 2. 应用名称（main flavor）
+          sed -i "s#<string name=\"app_name\" translatable=\"false\">[^<]*</string>#<string name=\"app_name\" translatable=\"false\">${APP_NAME}</string>#" "$STRINGS_FILE"
+
+          # 2b. 应用名称（fdroid flavor 有自己的 strings.xml，会在编译 fdroid
+          #     flavor 时覆盖 main 里的 app_name，必须单独替换，否则 fdroid
+          #     产物的应用名称还是 "v2rayNG (F-Droid)"）
+          sed -i "s#<string name=\"app_name\" translatable=\"false\">[^<]*</string>#<string name=\"app_name\" translatable=\"false\">${APP_NAME}</string>#" "$FDROID_STRINGS_FILE"
+
+          # 3. 桌面快捷方式 targetPackage（主 flavor）
+          sed -i "s/android:targetPackage=\"com.v2ray.ang\"/android:targetPackage=\"${APPLICATION_ID}\"/g" "$MAIN_SHORTCUTS"
+
+          # 4. 桌面快捷方式 targetPackage（fdroid flavor）
+          sed -i "s/android:targetPackage=\"com.v2ray.ang.fdroid\"/android:targetPackage=\"${FDROID_APPLICATION_ID}\"/g" "$FDROID_SHORTCUTS"
+
+          # 5. isXray() 用 BuildConfig.APPLICATION_ID 判断是否为 Xray 内核，改包名后会
+          #    误判为 false，导致行为和上游不一致，写死为 true 修正
+          sed -i 's/fun isXray(): Boolean = BuildConfig.APPLICATION_ID.startsWith("com.v2ray.ang")/fun isXray(): Boolean = true/' "$UTILS_FILE"
+
+          # 6. dev / pre_release 这两个 sourceSet 目前没有对应的 buildType/flavor 声明，
+          #    assembleRelease 不会用到它们，改不改都不影响当前产出的 APK。这里顺手
+          #    改掉纯粹是防御性处理：万一上游以后重新启用这两个变体，也不会漏改。
+          #    用 [ -f ] 判断文件是否存在，不存在就跳过——不能让这种"锦上添花"的
+          #    处理反过来导致整次同步失败。
+          if [ -f "$DEV_STRINGS_FILE" ]; then
+            sed -i "s#<item name=\"app_name\" type=\"string\">[^<]*</item>#<item name=\"app_name\" type=\"string\">${APP_NAME}</item>#" "$DEV_STRINGS_FILE"
+          fi
+          if [ -f "$PRE_RELEASE_STRINGS_FILE" ]; then
+            sed -i "s#<string name=\"app_name\" translatable=\"false\">[^<]*</string>#<string name=\"app_name\" translatable=\"false\">${APP_NAME}</string>#" "$PRE_RELEASE_STRINGS_FILE"
+          fi
+
+      # playstore flavor 目前没有专属 source set 目录，编译时会直接继承 main 的
+      # app_name / shortcuts.xml / applicationId（无 applicationIdSuffix），所以
+      # 上面对 main 相关文件的改名补丁其实同时覆盖了 playstore 和 fdroid 两个
+      # flavor。但这个"顺便覆盖"成立的前提是 playstore 没有自己的 source set——
+      # 如果上游以后给 playstore 也建了专属 res 目录（比如单独定义了 app_name），
+      # 现有补丁不会碰这个新目录，而且这种"应用名文本没改对"的问题不含包名
+      # 字面量，不会被后面的残留扫描步骤捕获，会在没有任何报错的情况下静默产出
+      # 一个应用名不一致的 APK。这里提前检测这种情况并主动失败，而不是等它
+      # 真的发生了才发现。
+      - name: Guard against future playstore-specific source set
+        if: steps.compare.outputs.should_sync == 'true'
+        run: |
+          set -euo pipefail
+          if [ -d "V2rayNG/app/src/playstore" ]; then
+            echo "::error::检测到上游新增了 V2rayNG/app/src/playstore 目录，现有改名补丁未覆盖该 flavor 专属资源，需要人工检查并更新本 workflow 后再重试。本次同步放弃，master 未受影响。"
+            exit 1
+          fi
+          echo "playstore flavor 仍未使用专属 source set，现有补丁覆盖范围有效"
+
+      - name: Verify rebrand took effect
+        if: steps.compare.outputs.should_sync == 'true'
+        run: |
+          set -euo pipefail
+          grep -q "applicationId = \"${APPLICATION_ID}\"" "$GRADLE_FILE" || { echo "::error::applicationId 替换失败"; exit 1; }
+          grep -q "<string name=\"app_name\" translatable=\"false\">${APP_NAME}</string>" "$STRINGS_FILE" || { echo "::error::app_name 替换失败 (main)"; exit 1; }
+          grep -q "<string name=\"app_name\" translatable=\"false\">${APP_NAME}</string>" "$FDROID_STRINGS_FILE" || { echo "::error::app_name 替换失败 (fdroid)"; exit 1; }
+          grep -q "android:targetPackage=\"${APPLICATION_ID}\"" "$MAIN_SHORTCUTS" || { echo "::error::主 flavor shortcuts 替换失败"; exit 1; }
+          grep -q "android:targetPackage=\"${FDROID_APPLICATION_ID}\"" "$FDROID_SHORTCUTS" || { echo "::error::fdroid flavor shortcuts 替换失败"; exit 1; }
+          grep -q 'fun isXray(): Boolean = true' "$UTILS_FILE" || { echo "::error::isXray() 补丁失败"; exit 1; }
+          if [ -f "$DEV_STRINGS_FILE" ]; then
+            grep -q "<item name=\"app_name\" type=\"string\">${APP_NAME}</item>" "$DEV_STRINGS_FILE" || { echo "::error::app_name 替换失败 (dev)"; exit 1; }
+          fi
+          if [ -f "$PRE_RELEASE_STRINGS_FILE" ]; then
+            grep -q "<string name=\"app_name\" translatable=\"false\">${APP_NAME}</string>" "$PRE_RELEASE_STRINGS_FILE" || { echo "::error::app_name 替换失败 (pre_release)"; exit 1; }
+          fi
+          echo "全部校验通过"
+
+      # 上面的校验只能确认"该替换的地方替换成功了"，无法发现"上游新增了一个
+      # 还没被现有几条 sed 覆盖到的硬编码包名引用"这种情况。这一步做一次
+      # 兜底扫描：改名后，资源文件(.xml)里理论上不应该再残留任何
+      # "com.v2ray.ang" 字面量（targetClass 除外，它对应的是编译期包名，
+      # namespace 没变所以本来就该保留）。
+      #
+      # 故意只扫 .xml，不扫 .kt / .kts：
+      #   - .kt 源码文件的 package/import 里本来就大量合法出现 com.v2ray.ang
+      #     （namespace 没变），扫了全是噪音。
+      #   - build.gradle.kts 里的 namespace = "com.v2ray.ang" 同理是合法保留项，
+      #     如果连 .kts 也扫，这一行会被当成"未覆盖的残留"而误报，导致
+      #     每次同步都失败。applicationId 那一行已经在上面单独校验过了，
+      #     不需要在这里重复扫描 .kts。
+      #
+      # 如果扫到残留，说明上游这次更新引入了新的、本 workflow 还不知道的
+      # 改名点，直接失败退出，不落地 master，等人工确认后再更新这个 workflow
+      # 的补丁规则和这里的白名单。
+      #
+      # 白名单不是按"属性名"维护的（比如只放行 targetClass=），因为上游随时
+      # 可能在别的属性里（android:name、android:process、tools:context……）
+      # 写出同样合法的完整类名引用，按属性名列白名单永远列不全。这里改用
+      # Java/Kotlin 的命名惯例来区分两类字符串：
+      #   - 包名字面量（真正需要改名，比如 "com.v2ray.ang"、
+      #     "com.v2ray.ang.fdroid"）—— 全小写
+      #   - 完整类名引用（namespace 没变，本来就该保留，比如
+      #     "com.v2ray.ang.ui.SettingsActivity$SettingsFragment"）—— 类名
+      #     部分按惯例首字母大写
+      # 用引号内是否出现大写字母来判断：只要 "com.v2ray.ang..." 这个被引号
+      # 包住的完整值里出现了大写字母，就认定是类名引用，直接放行；否则才是
+      # 需要人工处理的包名字面量残留。
+      - name: Scan for uncovered hardcoded package references
+        if: steps.compare.outputs.should_sync == 'true'
+        run: |
+          set -euo pipefail
+          residual=$(grep -rn "com\.v2ray\.ang" --include=*.xml V2rayNG/app/src \
+            | grep -v "targetClass=" \
+            | grep -vP '"com\.v2ray\.ang[a-zA-Z0-9_.$]*[A-Z][a-zA-Z0-9_.$]*"' || true)
+          if [ -n "$residual" ]; then
+            echo "::error::发现未被现有改名补丁覆盖的硬编码包名引用，可能是上游新增了改名点，需要人工检查并更新本 workflow 后再重试。本次同步放弃，master 未受影响。"
+            echo "$residual"
+            exit 1
+          fi
+          echo "未发现遗漏的硬编码包名引用"
+
+      - name: Push staging branch
+        if: steps.compare.outputs.should_sync == 'true'
+        id: push_staging
+        run: |
+          set -euo pipefail
+          git config user.name "zhuhen-bot"
+          git config user.email "zhuhen-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "stage: upstream v${{ steps.find_commit.outputs.version }} (rebrand to ZhuHen)"
+
+          # sync-staging 分支的内容直接来自上游提交，其中可能包含上游自己的
+          # .github/workflows/*.yml（比如上游的 build.yml）。GITHUB_TOKEN 无论
+          # 授予多大的 contents/actions 权限，GitHub 都不允许它创建或更新 workflow
+          # 文件，这是硬性限制，无法通过 permissions 块开启，必须用带 workflow
+          # scope 的真实 PAT（已在 job 开头切换过一次，origin 现在用的就是 PAT）。
+          #
+          # -c 的优先级高于任何仓库/全局级 git config，这里再强制覆盖一次
+          # extraheader 为空，确保这次 push 100% 只用 remote URL 里的 SYNC_PAT
+          # 认证，不会因为中间步骤意外恢复旧凭据而失败。
+          git -c http.https://github.com/.extraheader= push --force origin "$STAGING_BRANCH"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # ---------- 第三步：对 staging 分支触发正式构建，原地等结果 ----------
+
+      # build.yml 里的 svenstaro/upload-release-action 没有开 overwrite，
+      # 默认 overwrite=false：如果同一个 tag 下已经存在同名 asset（比如上一次
+      # 强制测试用了同一个版本号、或者上一次真实同步在上传阶段失败但已经
+      # 传了部分文件），这次重新上传会报 asset already_exists 而失败。
+      # 为了让"构建失败 -> 明天自动重试"真正具备幂等性，这里在触发构建前
+      # 主动删掉同 tag 的旧 Release（如果存在），不存在则忽略错误继续。
+      - name: Clean up any pre-existing release with the same tag
+        if: steps.compare.outputs.should_sync == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release delete "${{ steps.find_commit.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --yes --cleanup-tag || true
+
+      - name: Trigger build.yml on staging branch
+        if: steps.compare.outputs.should_sync == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 显式指定 --repo：仓库里同时存在 origin（你的 fork）和 upstream
+          # （2dust/v2rayNG）两个 remote，gh CLI 自动探测当前仓库时会优先选中
+          # upstream，导致 dispatch 请求发错地方，必须显式指定目标仓库。
+          gh workflow run build.yml \
+            --repo "${{ github.repository }}" \
+            --ref "$STAGING_BRANCH" \
+            -f release_tag="${{ steps.find_commit.outputs.version }}"
+
+      - name: Locate the triggered run
+        if: steps.compare.outputs.should_sync == 'true'
+        id: locate_run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          target_sha="${{ steps.push_staging.outputs.sha }}"
+          run_id=""
+          for i in $(seq 1 30); do
+            run_id=$(gh run list --repo "${{ github.repository }}" --workflow=build.yml \
+              --branch="$STAGING_BRANCH" --json databaseId,headSha,event,createdAt \
+              --jq ".[] | select(.headSha==\"$target_sha\" and .event==\"workflow_dispatch\") | .databaseId" | head -1)
+            if [ -n "$run_id" ]; then
+              break
+            fi
+            echo "还没找到对应的 run，等待中... ($i/30)"
+            sleep 10
+          done
+
+          if [ -z "$run_id" ]; then
+            echo "::error::5 分钟内没能定位到 build.yml 针对 $target_sha 触发的 run，放弃本次同步，master 未受影响。"
+            exit 1
+          fi
+
+          echo "定位到 run: $run_id"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for build.yml to finish
+        if: steps.compare.outputs.should_sync == 'true'
+        id: wait_build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh run watch "${{ steps.locate_run.outputs.run_id }}" --repo "${{ github.repository }}" --exit-status
+
+      # ---------- 第四步：构建失败 -> 直接结束，master 从未被动过 ----------
+
+      - name: Build failed, abort without touching master
+        if: steps.compare.outputs.should_sync == 'true' && failure() && steps.wait_build.outcome == 'failure'
+        run: |
+          echo "::error::构建或发布失败（run: ${{ steps.locate_run.outputs.run_id }}），本次同步放弃，master 完全未受影响。明天会自动重新尝试。"
+          exit 1
+
+      # ---------- 第五步：构建成功 -> 把 staging 的内容落到 master ----------
+
+      - name: Promote staging branch to master
+        if: steps.compare.outputs.should_sync == 'true' && steps.wait_build.outcome == 'success'
+        run: |
+          set -euo pipefail
+
+          # 备份当前 master 上我们自己的 workflow 文件（staging 分支上没有这个文件，
+          # 因为它整条分支都是"上游提交 + 改名"，我们不需要、也没必要在 staging 上放它）
+          git checkout master
+          cp "$WORKFLOW_SELF_PATH" /tmp/workflow-self-backup.yml
+
+          git reset --hard "origin/${STAGING_BRANCH}"
+
+          mkdir -p "$(dirname "$WORKFLOW_SELF_PATH")"
+          cp /tmp/workflow-self-backup.yml "$WORKFLOW_SELF_PATH"
+
+          git config user.name "zhuhen-bot"
+          git config user.email "zhuhen-bot@users.noreply.github.com"
+          git add -A
+          # 落到 master 这一步用 SYNC_PAT（真实 PAT）推送，和 GITHUB_TOKEN 不同，
+          # PAT 推送会正常触发别的 workflow 的 on:push（比如 build.yml、fastlane.yml），
+          # 而这次构建早已经通过 staging 分支跑过并确认成功了，没必要再触发一次，
+          # 提交信息里带上 [skip ci]，GitHub 会跳过这次 push 触发的所有 workflow
+          git commit -m "release: upstream v${{ steps.find_commit.outputs.version }} (rebrand to ZhuHen, build verified) [skip ci]"
+
+          # 这一步会改动 .github/workflows/ 下的文件，GITHUB_TOKEN 无论给多大权限
+          # 都会被 GitHub 拒绝写入，必须用带 workflow 权限的 PAT（已在 job 开头
+          # 切换过一次，origin 现在用的就是 PAT）。这里同样用 -c 强制覆盖一次
+          # extraheader，确保不会用回 GITHUB_TOKEN。
+          git -c http.https://github.com/.extraheader= push --force origin master
+
+      # ---------- 第六步：无论上面是否有新版本、构建成不成功，最后都检查一次
+      # Release 的 Latest / Pre-release 标记是否需要跟上游同步 ----------
+      #
+      # 三种情况都要跑到（都用 always()）：
+      #   - should_sync=false（没有新版本）-> 检查的是 master 上现有版本的标记，
+      #     应对"版本早就同步过了，但上游今天才把那个版本从 Pre-release 转正"
+      #     这种滞后场景
+      #   - should_sync=true 且构建成功 -> master 已经落地新版本，构建产物和
+      #     Release 都已就绪，这里可以立刻跟上游同步标记，不用等到第二天
+      #   - should_sync=true 但构建失败 -> master 没被动过，检查的还是原来
+      #     那个版本的标记，等同于"没发生过"的情况，跑一遍无害
+      #
+      # 不用 releases 列表接口猜"谁是最新"（GitHub 官方文档没有为 List releases
+      # 承诺任何排序规则，List releases 和有明确排序承诺的 /releases/latest
+      # 是两个不同的接口；已经有真实项目因为依赖列表顺序判断"最新版本"而选错
+      # 过），而是直接按 tag 精确查询——用 git show 读 origin/master 上当前的
+      # versionName 作为 tag，不依赖当前工作区处于哪个分支、不受前面步骤成败
+      # 影响。
+
+      - name: Determine currently published version
+        if: always()
+        id: current_version
+        run: |
+          set -euo pipefail
+          git fetch origin master
+          version=$(git show "origin/master:${GRADLE_FILE}" | grep -m1 'versionName = "' | sed -E 's/.*versionName = "([^"]+)".*/\1/' || true)
+          if [ -z "$version" ]; then
+            echo "::warning::读取不到 master 上的 versionName，跳过本次标记同步。"
+            echo "version=" >> "$GITHUB_OUTPUT"
+          else
+            echo "当前已发布版本: $version"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get upstream release for this exact tag
+        if: always() && steps.current_version.outputs.version != ''
+        id: upstream_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.current_version.outputs.version }}"
+          if ! json=$(gh api "repos/${UPSTREAM_REPO}/releases/tags/${tag}" 2>/dev/null); then
+            echo "上游还没有 tag=${tag} 的 release，跳过本次标记同步。"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$(echo "$json" | jq -r '.prerelease')" >> "$GITHUB_OUTPUT"
+
+      - name: Get our release for this exact tag
+        if: always() && steps.upstream_release.outputs.found == 'true'
+        id: our_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.current_version.outputs.version }}"
+          if ! json=$(gh api "repos/${{ github.repository }}/releases/tags/${tag}" 2>/dev/null); then
+            echo "本仓库还没有 tag=${tag} 的 release，跳过本次标记同步。"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "id=$(echo "$json" | jq -r '.id')" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$(echo "$json" | jq -r '.prerelease')" >> "$GITHUB_OUTPUT"
+
+      - name: Sync Latest / Pre-release mark if needed
+        if: always() && steps.our_release.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          upstream_prerelease="${{ steps.upstream_release.outputs.prerelease }}"
+          our_prerelease="${{ steps.our_release.outputs.prerelease }}"
+          release_id="${{ steps.our_release.outputs.id }}"
+
+          if [ "$upstream_prerelease" = "$our_prerelease" ]; then
+            echo "标记已经一致（prerelease=$our_prerelease），无需处理。"
+            exit 0
+          fi
+
+          if [ "$upstream_prerelease" = "false" ]; then
+            echo "上游已转正为 Latest，同步打标记..."
+            make_latest="true"
+          else
+            echo "上游标记回退为 Pre-release（少见，但同步一下）..."
+            make_latest="false"
+          fi
+
+          gh api -X PATCH "repos/${{ github.repository }}/releases/${release_id}" \
+            -F prerelease="$upstream_prerelease" \
+            -f make_latest="$make_latest"
+
+          echo "已同步：prerelease=$upstream_prerelease, make_latest=$make_latest"
