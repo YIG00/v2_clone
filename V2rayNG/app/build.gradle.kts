@@ -14,7 +14,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.v2ray.ang"
+        applicationId = "com.zhuhen.app"
         minSdk = 24
         targetSdk = 37
         versionCode = 763
